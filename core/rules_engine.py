@@ -2,16 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 档案智能分类系统 - 规则引擎
-
-修正记录：
-  v2 - 2026-02-22
-  [Fix1] 规则2（简报）执行后设锁标志位，防止后续规则覆盖10年期限
-  [Fix2] 规则1（培训）不再硬编码保管期限，仅在LLM判定为10年时才强制提升为30年
-  [Fix3] 规则7兜底扩展：使用 PERIOD_ORDER 比较，任何低于30年的期限均提升为30年
-  [Fix4] 规则10增加选举结果排除逻辑，防止换届选举结果（永久）被误降为30年
-  [Fix5] _resolve_code 改为精确匹配，防止"业务管理类"等误匹配
-  [Fix6] 删除 WORK_SECRET_KEYWORDS 在 _apply_open_status_rules 中的冗余调用
-  [Fix7] "约谈"从 NEGATIVE_TITLE_KEYWORDS 移除，改为"诫勉约谈"精确匹配（已在constants更新）
 """
 
 import re
@@ -40,6 +30,7 @@ from constants import (
     PARTY_BRANCH_ADJUST_KEYWORDS,
     PARTY_BRANCH_ELECTION_RESULT_KEYWORDS,
     PARTY_BRANCH_TARGET_KEYWORDS,
+    PARTY_BRANCH_KEYWORDS,
     REGULATION_KEYWORDS,
     TRAINING_KEYWORDS,
     TRAINING_MGMT_KEYWORDS,
@@ -51,13 +42,14 @@ from constants import (
 
 class RulesEngine:
     """
-    规则引擎：按优先级顺序执行四层规则修正
+    规则引擎：按优先级顺序执行五层规则修正
 
     执行顺序：
-      0. _force_fix_fields            — 强制字段修正
-      1. _apply_supplementary_rules   — 10条补充规则（最高优先级）
-      2. _apply_open_status_rules     — 开放状态与延期开放理由判定
+      0. _force_fix_fields             — 强制字段修正
+      1. _apply_supplementary_rules    — 10条补充规则（最高优先级）
+      2. _apply_open_status_rules      — 开放状态与延期开放理由判定
       3. _validate_classification_code — 编码格式校验
+      4. _clean_title                  — 题名后处理（去除LLM拼入的编号/日期/重复内容）
     """
 
     def apply_all(self, metadata: Dict, ocr_text: str) -> Dict:
@@ -66,6 +58,7 @@ class RulesEngine:
         metadata = self._apply_supplementary_rules(metadata, ocr_text)
         metadata = self._apply_open_status_rules(metadata, ocr_text)
         metadata = self._validate_classification_code(metadata)
+        metadata = self._clean_title(metadata)
         print("[规则修正完成]\n")
         return metadata
 
@@ -226,7 +219,7 @@ class RulesEngine:
 
         # ── 规则10: 党支部更换组织/委员/书记的请示 → 党群类，30年 ──────────
         # 排除：换届选举结果类文件（属永久，不得被降级）
-        if "党支部" in content:
+        if any(kw in content for kw in PARTY_BRANCH_KEYWORDS):
             is_adjust = any(kw in content for kw in PARTY_BRANCH_ADJUST_KEYWORDS)
             is_target = any(kw in content for kw in PARTY_BRANCH_TARGET_KEYWORDS)
             is_request = "请示" in content
@@ -250,7 +243,6 @@ class RulesEngine:
         if metadata.get("实体分类名称") == "业务类":
             is_legitimate_business = any(kw in content for kw in BUSINESS_LEGITIMATE_KEYWORDS)
             if not is_legitimate_business:
-                # 检查文种：题名中出现综合类典型文种
                 is_false_positive = any(doc_type in title for doc_type in BUSINESS_FALSE_POSITIVE_DOC_TYPES)
                 if is_false_positive:
                     print(f"[业务类兜底] 题名含综合类文种（{title}），非档案/培训文件，强制纠正 → 综合类")
@@ -370,6 +362,127 @@ class RulesEngine:
                     f" (文件年份: {year})"
                 )
             metadata["实体分类号"] = expected_code
+
+        return metadata
+
+    # ── 优先级4：题名后处理 ───────────────────────────────────────────────────
+
+    def _clean_title(self, metadata: Dict) -> Dict:
+        """
+        题名字段后处理兜底（[Fix8-Fix13]）
+
+        针对LLM高频确定性错误进行硬性清除，不涉及语义判断。
+        处理规则（按执行顺序）：
+
+          规则1  — 去除末尾纯数字日期        [20191106]、(20200527)
+          规则2  — 去除末尾中文日期          [2019年9月3日]、(2020年5月27日)
+          规则3  — 去除末尾年份版本标注      [2019年版]、[2020年号]
+          规则4  — 去除开头年份标注          [2020]、(2019)
+          规则5  — 去除开头中文日期          [2024年11月22日]
+          规则6  — 去除末尾带括号文件编号    (黄脉源通政发[2020]2号)
+          规则6b — 去除末尾裸露文件编号      黄脉源通政发(2019)23号（无外层括号）
+          规则6c — 去除末尾 [YYYY]N号 编号   [2019]1号
+          规则7  — 去除无意义重复另拟        题名[题名]（[ ]内容与主体完全相同）
+          规则8a — 去除简报破折号后来源描述  ——金安集团高温慰问活动简报
+          规则8b — 去除简报末尾期号（带符号）— 第3期
+          规则8c — 去除简报末尾期号（带括号）（第3期）
+          规则8d — 去除简报末尾期号（裸露）  第3期
+          规则9  — 去除开头裸露编号前缀      26号 / 第26号
+          规则10 — 去除冗余前置另拟          [X]关于印发《X》的通知 → 关于印发《X》的通知
+
+        不处理的情形（属语义判断，保留给LLM）：
+          - [ ]内容与原题名不同的合法另拟（如 通知[共青团中央关于…的通知]）
+          - 合订件标注（如 关于XX的复函[及函]）
+        """
+        if not metadata:
+            return metadata
+
+        title = str(metadata.get("题名") or "").strip()
+        if not title:
+            return metadata
+
+        original = title
+
+        # ── 规则1: 末尾纯数字日期（6-8位） ───────────────────────────────────
+        # 匹配：[20191106]、(20200527)、【20200101】
+        title = re.sub(r'\s*[\[\(（【]\d{6,8}[\]\)）】]$', '', title)
+
+        # ── 规则2: 末尾中文日期 ───────────────────────────────────────────────
+        # 匹配：[2019年9月3日]、(2020年5月27日)
+        title = re.sub(
+            r'\s*[\[\(（【]\d{4}年\d{1,2}月\d{1,2}日[\]\)）】]$', '', title
+        )
+
+        # ── 规则3: 末尾年份版本标注 ───────────────────────────────────────────
+        # 匹配：[2019年版]、[2020年号]、[2019年期]
+        title = re.sub(r'\s*[\[\(（【]\d{4}年[版号期][\]\)）】]$', '', title)
+
+        # ── 规则4: 开头年份标注 ───────────────────────────────────────────────
+        # 匹配：[2020]、(2019)、【2020】
+        title = re.sub(r'^[\[\(（【]\d{4}[\]\)）】]\s*', '', title)
+
+        # ── 规则5: 开头中文日期 ───────────────────────────────────────────────
+        # 匹配：[2024年11月22日]、(2020年5月27日)
+        title = re.sub(
+            r'^[\[\(（【]\d{4}年\d{1,2}月\d{1,2}日[\]\)）】]\s*', '', title
+        )
+
+        # ── 规则6: 末尾带括号文件编号 ─────────────────────────────────────────
+        # 匹配：(黄脉源通政发[2020]2号)、（脉源通[2019]5号）
+        # 特征：括号内含中文机构名 + [YYYY] + 数字 + 号
+        title = re.sub(
+            r'\s*[\(（][^\)）]{0,30}[\[【]\d{4}[\]】][^\)）]{0,10}[\)）]$', '', title
+        )
+
+        # ── 规则6b: 末尾裸露文件编号（无外层括号） ────────────────────────────
+        # 匹配：黄脉源通政发(2019)23号、脉源通(2020)5号
+        # 特征：空格后接中文机构简称 + (YYYY) + 数字 + 号，紧贴末尾
+        title = re.sub(
+            r'\s+[^\s\[\(]{1,10}[\(\[（【]\d{4}[\)\]）】]\d+号$', '', title
+        )
+
+        # ── 规则6c: 末尾 [YYYY]N号 形式编号 ──────────────────────────────────
+        # 匹配：[2019]1号、[2020]12号
+        title = re.sub(r'\s*\[\d{4}\]\d+号$', '', title)
+
+        # ── 规则7: 无意义重复另拟 ─────────────────────────────────────────────
+        # 匹配：关于春节放假的通知[关于春节放假的通知]
+        # 仅处理[ ]内容与主体完全相同的情形，不误删合法另拟
+        repeat_match = re.match(r'^(.+?)\s*\[(\1)\]$', title)
+        if repeat_match:
+            title = repeat_match.group(1)
+
+        # ── 规则8: 简报专项清洗（仅在题名含"简报"时触发）────────────────────
+        if "简报" in title:
+            # 规则8a: 去除破折号后拼接的来源单位+简报描述
+            # 匹配：……炎炎夏日"送清凉"——金安集团高温慰问活动简报
+            # 保留：不忘初心……廉洁自律（简报在主体中不在尾部补充描述）
+            title = re.sub(r'\s*[—－]{1,2}[^—]{2,30}简报$', '', title)
+            # 规则8b: 去除末尾带连字符的期号：— 第3期、- 第3期
+            title = re.sub(r'\s*[-－—]\s*第\d+期$', '', title)
+            # 规则8c: 去除末尾带括号的期号：（第3期）、(第3期)
+            title = re.sub(r'\s*[（(【]\s*第\d+期\s*[)）】]\s*$', '', title)
+            # 规则8d: 去除末尾裸露期号：第3期
+            title = re.sub(r'\s*第\d+期$', '', title)
+
+        # ── 规则9: 开头裸露编号前缀 ───────────────────────────────────────────
+        # 匹配：26号 关于…、第26号 关于…
+        # 防止误删：仅匹配1-3位数字+号，后跟空格
+        title = re.sub(r'^第?\d{1,3}号\s+', '', title)
+
+        # ── 规则10: 冗余前置另拟 ──────────────────────────────────────────────
+        # 匹配：[公司接待管理标准]关于印发《公司接待管理标准》的通知
+        # 逻辑：[ ]内容与后文《》内容相同时，去除前置[ ]部分
+        # 仅处理"关于印发《X》"结构，避免误删其他合法前置另拟
+        title = re.sub(
+            r'^\[([^\]]+)\](关于印发《\1》.*)', r'\2', title
+        )
+
+        title = title.strip()
+
+        if title != original:
+            print(f"[题名清洗] {original!r} → {title!r}")
+            metadata["题名"] = title
 
         return metadata
 
